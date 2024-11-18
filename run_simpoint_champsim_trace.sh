@@ -7,12 +7,12 @@ output=$1
 cmd="${@:2}"
 bb_interval=100000000
 
-CMD_GETBBV="~/qemu/build/qemu-loongarch64 -D log.txt -d plugin -plugin ~/qemu_plugins/build/libbbv_ibar.so,name=${output},size=${bb_interval} -- $cmd"
+CMD_GETBBV="~/qemu/build/qemu-loongarch64 -D log.txt -d plugin -plugin ~/qemu_plugins/build/libbbv.so,outfile=${output}/out,interval=${bb_interval} -- $cmd"
 
 echo ${CMD_GETBBV}
 eval ${CMD_GETBBV}
 
-CMD_GETSIMPOINT="/ht/320/btracer/SimPoint.3.2/bin/simpoint -maxK 5 -loadFVFile ${output}/bbv -saveSimpoints ${output}/simpoints -saveSimpointWeights ${output}/weights >/dev/null"
+CMD_GETSIMPOINT="/ht/320/btracer/SimPoint.3.2/bin/simpoint -maxK 5 -loadFVFile ${output}/out.0.bb -saveSimpoints ${output}/simpoints -saveSimpointWeights ${output}/weights >/dev/null"
 echo ${CMD_GETSIMPOINT}
 eval ${CMD_GETSIMPOINT}
 
