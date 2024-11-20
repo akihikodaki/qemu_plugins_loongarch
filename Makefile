@@ -58,8 +58,8 @@ $(BUILD_DIR)/libbbv.so: $(QEMU_DIR)/contrib/plugins/bbv.c
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
 
-$(CHAMPSIM_DIR)/riscv-unified-db/gen/champsim/riscv.h:
-	$(MAKE) -C $(CHAMPSIM_DIR) riscv-unified-db/gen/champsim/riscv.h
+$(CHAMPSIM_DIR)/%:
+	$(MAKE) -C $(CHAMPSIM_DIR) $*
 
 -include $(DEPS)
 
