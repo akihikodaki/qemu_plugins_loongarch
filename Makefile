@@ -1,7 +1,8 @@
 QEMU_DIR ?=${HOME}/qemu
 GLIB_INC ?=$(shell pkg-config --cflags glib-2.0)
 CFLAGS ?= -march=native -g -Wall -march=native -I $(QEMU_DIR)/include/qemu/ $(GLIB_INC) -O2 -MMD -MP
-CXXFLAGS ?= -march=native -g -Wall -std=c++14 -march=native -iquote $(QEMU_DIR)/include/qemu/ -I$(CHAMPSIM_DIR)/inc -I$(CHAMPSIM_DIR)/loongarch -I$(CHAMPSIM_DIR)/riscv-unified-db/gen/champsim $(GLIB_INC) -O2 -std=c++17 -MMD -MP
+TRIPLET_DIR = $(patsubst %/,%,$(firstword $(filter-out $(CHAMPSIM_DIR)/vcpkg_installed/vcpkg/, $(wildcard $(CHAMPSIM_DIR)/vcpkg_installed/*/))))
+CXXFLAGS ?= -march=native -g -Wall -std=c++14 -march=native -iquote $(QEMU_DIR)/include/qemu/ -I$(CHAMPSIM_DIR)/inc -I$(CHAMPSIM_DIR)/loongarch -I$(TRIPLET_DIR)/include -L$(TRIPLET_DIR)/lib $(GLIB_INC) -O2 -std=c++17 -MMD -MP
 #-I/home/lxy/github/capstone/include/
 ifeq ($(wildcard $(QEMU_DIR)),)
     $(error $$QEMU_DIR [$(QEMU_DIR)] not exsited)
@@ -50,9 +51,9 @@ $(QEMU_DIR):
 	@echo "Folder $(QEMU_DIR) does not exist"
 	false
 
-$(BUILD_DIR)/lib%.so : %.cc | $(CHAMPSIM_DIR)/riscv-unified-db/gen/champsim/riscv.h
+$(BUILD_DIR)/lib%.so : %.cc
 	mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $< -ldl -lrt -lz
+	$(CXX) $(CXXFLAGS) -shared -fPIC -o $@ $< -lcapstone -ldl -lrt -lz
 
 $(BUILD_DIR)/libbbv.so: $(QEMU_DIR)/contrib/plugins/bbv.c
 	mkdir -p $(dir $@)

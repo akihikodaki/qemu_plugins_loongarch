@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <capstone/capstone.h>
+#include <iomanip>
+#include <optional>
 #include <iostream>
 #include <sstream>
 #include <fstream>
@@ -25,7 +28,6 @@ extern "C" {
 
 #include "util.h"
 #include "loongarch_decode_insns.c.inc"
-#include "riscv.h"
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
 
@@ -48,6 +50,19 @@ typedef struct trace_instr_format {
     unsigned char destination_registers[NUM_INSTR_DESTINATIONS]; // output registers
     unsigned char source_registers[NUM_INSTR_SOURCES];           // input registers
 } trace_instr_format_t;
+
+// branch types
+enum branch_type {
+  NOT_BRANCH = 0,
+  BRANCH_DIRECT_JUMP = 1,
+  BRANCH_INDIRECT = 2,
+  BRANCH_CONDITIONAL = 3,
+  BRANCH_DIRECT_CALL = 4,
+  BRANCH_INDIRECT_CALL = 5,
+  BRANCH_RETURN = 6,
+  BRANCH_OTHER = 7,
+  BRANCH_YIELD = 8
+};
 
 const char* branch_type(int is_branch) {
     switch (is_branch) {
@@ -176,8 +191,49 @@ namespace riscv {
         "ft8", "ft9", "ft10", "ft11"
     };
 
+    class disassembler_t {
+    public:
+        disassembler_t() {
+            auto err = cs_open(CS_ARCH_RISCV, CS_MODE_RISCV64, &handle);
+            if (err) {
+                throw std::runtime_error("cs_open: "s + cs_strerror(err));
+            }
+
+            err = cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+            if (err) {
+                cs_close(&handle);
+                throw std::runtime_error("cs_option: "s + cs_strerror(err));
+            }
+
+            insn = cs_malloc(handle);
+            if (!insn) {
+                err = cs_errno(handle);
+                cs_close(&handle);
+                throw std::runtime_error("cs_malloc: "s + cs_strerror(err));
+            }
+        }
+
+        ~disassembler_t() {
+            cs_free(insn, 1);
+            cs_close(&handle);
+        }
+
+        const cs_insn *disasm(const uint8_t *code, size_t size, uint64_t address) {
+            cs_disasm_iter(handle, &code, &size, &address, insn);
+            return insn;
+        }
+
+    private:
+        cs_insn *insn;
+        csh handle;
+    };
+
     static const size_t size = (sizeof(cpu) + sizeof(fpu)) / sizeof(const char *);
-    static bool target;
+    static optional<disassembler_t> disassembler;
+
+    static bool link(uint8_t r) {
+        return r == 1 || r == 5;
+    }
 };
 
 class vcpu {
@@ -185,7 +241,7 @@ public:
     vcpu(unsigned int vcpu_index) : buf(g_byte_array_new()), vcpu_index(vcpu_index) {
         mem_stream.exceptions(ofstream::badbit | ofstream::failbit | ofstream::eofbit);
 
-        if (riscv::target) {
+        if (riscv::disassembler) {
             g_autoptr(GArray) descriptors = qemu_plugin_get_registers();
 
             for (guint i = 0; i < descriptors->len; i++) {
@@ -233,7 +289,7 @@ public:
     }
 
     void mem_write(uint64_t vaddr) {
-        uint64_t page_size = riscv::target ? 4096 : 16384;
+        uint64_t page_size = riscv::disassembler ? 4096 : 16384;
         auto page_vaddr = vaddr - vaddr % page_size;
 
         if (!mem_vaddrs.insert(page_vaddr).second) {
@@ -401,20 +457,68 @@ void fill_insn_template(trace_instr_format* insn, uint64_t pc,
     insn->ip = pc;
     insn->branch_taken = size;
     insn->inst = data;
-    if (riscv::target) {
-        champsim::riscv::decoded_inst decoded_inst(data);
-        insn->is_branch = decoded_inst.branch_type;
+    if (riscv::disassembler) {
+        auto disasmed = riscv::disassembler->disasm(reinterpret_cast<const uint8_t *>(&insn->inst), size, pc);
+        auto source_register = insn->source_registers;
 
-        for (uint8_t i = 0;
-             i < NUM_INSTR_SOURCES && decoded_inst.source_registers[i] != UINT8_MAX;
-             i++) {
-            insn->source_registers[i] = decoded_inst.source_registers[i];
+        for (uint8_t i = 0; i < disasmed->detail->regs_read_count; i++) {
+            *source_register = disasmed->detail->riscv.operands[i].reg;
+            source_register++;
         }
 
-        for (uint8_t i = 0;
-             i < NUM_INSTR_DESTINATIONS && decoded_inst.destination_registers[i] != UINT8_MAX;
-             i++) {
-            insn->destination_registers[i] = decoded_inst.destination_registers[i];
+        for (uint8_t i = 0; i < disasmed->detail->riscv.op_count; i++) {
+            if (disasmed->detail->riscv.operands[i].access & CS_AC_READ &&
+                disasmed->detail->riscv.operands[i].type == RISCV_OP_REG) {
+                *source_register = disasmed->detail->riscv.operands[i].reg;
+                source_register++;
+            }
+        }
+
+        if (disasmed->detail->regs_write_count) {
+            insn->destination_registers[0] = disasmed->detail->regs_write[0];
+        } else {
+            for (uint8_t i = 0; i < disasmed->detail->riscv.op_count; i++) {
+                if (disasmed->detail->riscv.operands[i].access & CS_AC_WRITE &&
+                    disasmed->detail->riscv.operands[i].type == RISCV_OP_REG) {
+                    insn->destination_registers[0] = disasmed->detail->riscv.operands[i].reg;
+                    break;
+                }
+            }
+        }
+
+        switch (disasmed->id) {
+            case RISCV_INS_BEQ:
+            case RISCV_INS_BGE:
+            case RISCV_INS_BGEU:
+            case RISCV_INS_BLT:
+            case RISCV_INS_BLTU:
+            case RISCV_INS_BNE:
+            case RISCV_INS_C_BEQZ:
+            case RISCV_INS_C_BNEZ:
+                insn->is_branch = BRANCH_CONDITIONAL;
+                break;
+
+            case RISCV_INS_C_J:
+                insn->is_branch = BRANCH_DIRECT_JUMP;
+                break;
+
+            case RISCV_INS_C_JAL:
+            case RISCV_INS_JAL:
+                insn->is_branch = riscv::link(insn->destination_registers[0]) ?
+                                  BRANCH_DIRECT_CALL : BRANCH_DIRECT_JUMP;
+                break;
+
+            case RISCV_INS_C_JALR:
+            case RISCV_INS_JALR:
+                if (riscv::link(insn->destination_registers[0])) {
+                    insn->is_branch = riscv::link(insn->source_registers[0]) &&
+                                      insn->source_registers[0] == insn->destination_registers[0] ?
+                                      BRANCH_YIELD : BRANCH_INDIRECT_CALL;
+                } else {
+                    insn->is_branch = riscv::link(insn->source_registers[0]) ?
+                                      BRANCH_RETURN : BRANCH_INDIRECT;
+                }
+                break;
         }
 
         return;
@@ -471,6 +575,7 @@ void plugin_exit(qemu_plugin_id_t id, void* p) {
             }
 
         }
+        riscv::disassembler.reset();
         vcpu::exit();
         fprintf(stderr, "plugin fini, trace fini\n");
     } catch (exception& e) {
@@ -479,7 +584,7 @@ void plugin_exit(qemu_plugin_id_t id, void* p) {
 }
 
 static void qemu_dump_guest_reg(vcpu& vcpu, const char* filename) {
-    if (riscv::target) {
+    if (riscv::disassembler) {
         ofstream stream(filename);
         for (size_t i = 0; i < riscv::size; i++) {
             auto buf = vcpu.riscv_read(i);
@@ -531,7 +636,7 @@ static void vcpu_insn_exec(unsigned int vcpu_index, void* userdata) {
             } else {
                 t->branch_taken = 0;
             }
-            if (riscv::target) {
+            if (riscv::disassembler) {
                 t->ret_val = vcpu->riscv_read(t->destination_registers[0]);
             } else {
     #ifdef QEMU_PLUGIN_HAS_ENV_PTR
@@ -695,7 +800,7 @@ int qemu_plugin_install(qemu_plugin_id_t id, const qemu_info_t *info,
         plugin_init(info);
 
         if (!strcmp(info->target_name, "riscv64")) {
-            riscv::target = true;
+            riscv::disassembler.emplace();
         } else if (strcmp(info->target_name, "loongarch64")) {
             throw runtime_error("unknown target");
         }
